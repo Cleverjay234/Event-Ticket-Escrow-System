@@ -18,10 +18,15 @@
 (define-constant err-insufficient-funds (err u110))
 (define-constant err-event-verified (err u111))
 (define-constant err-verification-period-ended (err u112))
+(define-constant err-auction-not-found (err u113))
+(define-constant err-auction-ended (err u114))
+(define-constant err-bid-too-low (err u115))
+(define-constant err-auction-active (err u116))
 
 ;; data vars
 (define-data-var next-event-id uint u1)
 (define-data-var platform-fee-rate uint u250)
+(define-data-var next-auction-id uint u1)
 
 ;; data maps
 (define-map events
@@ -69,6 +74,25 @@
 (define-map event-verification-counts
   { event-id: uint }
   { total-verifications: uint }
+)
+
+(define-map ticket-auctions
+  { auction-id: uint }
+  {
+    event-id: uint,
+    seller: principal,
+    original-buyer: principal,
+    starting-price: uint,
+    current-bid: uint,
+    current-bidder: (optional principal),
+    end-block: uint,
+    is-settled: bool
+  }
+)
+
+(define-map auction-bids
+  { auction-id: uint, bidder: principal }
+  { bid-amount: uint, bid-block: uint }
 )
 
 ;; public functions
@@ -316,6 +340,121 @@
   )
 )
 
+(define-public (create-ticket-auction (event-id uint) (starting-price uint) (duration-blocks uint))
+  (let
+    (
+      (event-info (unwrap! (map-get? events { event-id: event-id }) err-not-found))
+      (ticket-info (unwrap! (map-get? tickets { event-id: event-id, buyer: tx-sender }) err-not-purchased))
+      (auction-id (var-get next-auction-id))
+      (current-block burn-block-height)
+      (end-block (+ current-block duration-blocks))
+    )
+    (asserts! (not (get is-cancelled event-info)) err-event-cancelled)
+    (asserts! (< current-block (get event-date event-info)) err-event-past)
+    (asserts! (not (get is-refunded ticket-info)) err-already-exists)
+    (asserts! (is-eq (get current-owner ticket-info) tx-sender) err-unauthorized)
+    (asserts! (> starting-price u0) err-invalid-amount)
+    (asserts! (> duration-blocks u0) err-invalid-amount)
+    
+    (map-set ticket-auctions
+      { auction-id: auction-id }
+      {
+        event-id: event-id,
+        seller: tx-sender,
+        original-buyer: tx-sender,
+        starting-price: starting-price,
+        current-bid: u0,
+        current-bidder: none,
+        end-block: end-block,
+        is-settled: false
+      }
+    )
+    
+    (var-set next-auction-id (+ auction-id u1))
+    (ok auction-id)
+  )
+)
+
+(define-public (place-bid (auction-id uint) (bid-amount uint))
+  (let
+    (
+      (auction-info (unwrap! (map-get? ticket-auctions { auction-id: auction-id }) err-auction-not-found))
+      (current-block burn-block-height)
+    )
+    (asserts! (< current-block (get end-block auction-info)) err-auction-ended)
+    (asserts! (not (get is-settled auction-info)) err-auction-ended)
+    (asserts! (>= bid-amount (get starting-price auction-info)) err-bid-too-low)
+    (asserts! (> bid-amount (get current-bid auction-info)) err-bid-too-low)
+    
+    (match (get current-bidder auction-info)
+      previous-bidder
+        (try! (as-contract (stx-transfer? (get current-bid auction-info) tx-sender previous-bidder)))
+      true
+    )
+    
+    (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set auction-bids
+      { auction-id: auction-id, bidder: tx-sender }
+      { bid-amount: bid-amount, bid-block: current-block }
+    )
+    
+    (map-set ticket-auctions
+      { auction-id: auction-id }
+      (merge auction-info {
+        current-bid: bid-amount,
+        current-bidder: (some tx-sender)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (settle-auction (auction-id uint))
+  (let
+    (
+      (auction-info (unwrap! (map-get? ticket-auctions { auction-id: auction-id }) err-auction-not-found))
+      (current-block burn-block-height)
+      (winning-bid (get current-bid auction-info))
+      (platform-fee (/ (* winning-bid (var-get platform-fee-rate)) u10000))
+      (seller-payment (- winning-bid platform-fee))
+    )
+    (asserts! (>= current-block (get end-block auction-info)) err-auction-active)
+    (asserts! (not (get is-settled auction-info)) err-already-exists)
+    
+    (match (get current-bidder auction-info)
+      winner
+        (begin
+          (try! (as-contract (stx-transfer? seller-payment tx-sender (get seller auction-info))))
+          (try! (as-contract (stx-transfer? platform-fee tx-sender contract-owner)))
+          
+          (map-delete tickets { event-id: (get event-id auction-info), buyer: (get seller auction-info) })
+          
+          (map-set tickets
+            { event-id: (get event-id auction-info), buyer: winner }
+            {
+              purchase-block: current-block,
+              is-refunded: false,
+              is-transferred: true,
+              current-owner: winner
+            }
+          )
+        )
+      (begin
+        true
+      )
+    )
+    
+    (map-set ticket-auctions
+      { auction-id: auction-id }
+      (merge auction-info { is-settled: true })
+    )
+    
+    (ok true)
+  )
+)
+
 ;; read only functions
 
 (define-read-only (get-event (event-id uint))
@@ -344,6 +483,18 @@
 
 (define-read-only (get-next-event-id)
   (var-get next-event-id)
+)
+
+(define-read-only (get-auction (auction-id uint))
+  (map-get? ticket-auctions { auction-id: auction-id })
+)
+
+(define-read-only (get-auction-bid (auction-id uint) (bidder principal))
+  (map-get? auction-bids { auction-id: auction-id, bidder: bidder })
+)
+
+(define-read-only (get-next-auction-id)
+  (var-get next-auction-id)
 )
 
 ;; private functions
