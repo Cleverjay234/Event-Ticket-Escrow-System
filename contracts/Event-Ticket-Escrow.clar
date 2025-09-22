@@ -22,6 +22,8 @@
 (define-constant err-auction-ended (err u114))
 (define-constant err-bid-too-low (err u115))
 (define-constant err-auction-active (err u116))
+(define-constant err-dynamic-pricing-disabled (err u117))
+(define-constant err-invalid-pricing-params (err u118))
 
 ;; data vars
 (define-data-var next-event-id uint u1)
@@ -95,6 +97,19 @@
   { bid-amount: uint, bid-block: uint }
 )
 
+(define-map dynamic-pricing
+  { event-id: uint }
+  {
+    enabled: bool,
+    base-price: uint,
+    max-price: uint,
+    min-price: uint,
+    demand-multiplier: uint,
+    time-multiplier: uint,
+    last-updated: uint
+  }
+)
+
 ;; public functions
 
 (define-public (create-event (name (string-utf8 100)) (description (string-utf8 500)) (ticket-price uint) (max-tickets uint) (event-date uint) (verification-deadline uint))
@@ -157,11 +172,66 @@
   )
 )
 
+(define-public (enable-dynamic-pricing 
+  (event-id uint) 
+  (base-price uint) 
+  (max-price uint) 
+  (min-price uint)
+  (demand-multiplier uint)
+  (time-multiplier uint)
+)
+  (let
+    (
+      (event-info (unwrap! (map-get? events { event-id: event-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get organizer event-info)) err-unauthorized)
+    (asserts! (> base-price u0) err-invalid-amount)
+    (asserts! (>= max-price base-price) err-invalid-pricing-params)
+    (asserts! (<= min-price base-price) err-invalid-pricing-params)
+    (asserts! (> demand-multiplier u0) err-invalid-pricing-params)
+    (asserts! (> time-multiplier u0) err-invalid-pricing-params)
+    
+    (map-set dynamic-pricing
+      { event-id: event-id }
+      {
+        enabled: true,
+        base-price: base-price,
+        max-price: max-price,
+        min-price: min-price,
+        demand-multiplier: demand-multiplier,
+        time-multiplier: time-multiplier,
+        last-updated: burn-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (disable-dynamic-pricing (event-id uint))
+  (let
+    (
+      (event-info (unwrap! (map-get? events { event-id: event-id }) err-not-found))
+      (pricing-info (unwrap! (map-get? dynamic-pricing { event-id: event-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get organizer event-info)) err-unauthorized)
+    (asserts! (get enabled pricing-info) err-dynamic-pricing-disabled)
+    
+    (map-set dynamic-pricing
+      { event-id: event-id }
+      (merge pricing-info { enabled: false })
+    )
+    
+    (ok true)
+  )
+)
+
 (define-public (purchase-ticket (event-id uint))
   (let
     (
       (event-info (unwrap! (map-get? events { event-id: event-id }) err-not-found))
-      (ticket-price (get ticket-price event-info))
+      (current-price (get-current-ticket-price event-id))
+      (ticket-price (if (> current-price u0) current-price (get ticket-price event-info)))
       (current-block burn-block-height)
       (funds-info (unwrap! (map-get? event-funds { event-id: event-id }) err-not-found))
     )
@@ -495,6 +565,53 @@
 
 (define-read-only (get-next-auction-id)
   (var-get next-auction-id)
+)
+
+(define-read-only (get-dynamic-pricing (event-id uint))
+  (map-get? dynamic-pricing { event-id: event-id })
+)
+
+(define-read-only (get-current-ticket-price (event-id uint))
+  (match (map-get? dynamic-pricing { event-id: event-id })
+    pricing-info
+      (if (get enabled pricing-info)
+        (calculate-dynamic-price event-id)
+        u0
+      )
+    u0
+  )
+)
+
+(define-read-only (calculate-dynamic-price (event-id uint))
+  (let
+    (
+      (event-info (unwrap! (map-get? events { event-id: event-id }) u0))
+      (pricing-info (unwrap! (map-get? dynamic-pricing { event-id: event-id }) u0))
+      (current-block burn-block-height)
+      (sold-percentage (if (> (get max-tickets event-info) u0)
+        (/ (* (get sold-tickets event-info) u100) (get max-tickets event-info))
+        u0
+      ))
+      (blocks-until-event (if (> (get event-date event-info) current-block)
+        (- (get event-date event-info) current-block)
+        u0
+      ))
+      (demand-adjustment (/ (* sold-percentage (get demand-multiplier pricing-info)) u100))
+      (time-urgency (if (< blocks-until-event u1000)
+        (/ (* (- u1000 blocks-until-event) (get time-multiplier pricing-info)) u100)
+        u0
+      ))
+      (adjusted-price (+ (get base-price pricing-info) demand-adjustment time-urgency))
+      (final-price (if (> adjusted-price (get max-price pricing-info))
+        (get max-price pricing-info)
+        (if (< adjusted-price (get min-price pricing-info))
+          (get min-price pricing-info)
+          adjusted-price
+        )
+      ))
+    )
+    final-price
+  )
 )
 
 ;; private functions
