@@ -24,11 +24,15 @@
 (define-constant err-auction-active (err u116))
 (define-constant err-dynamic-pricing-disabled (err u117))
 (define-constant err-invalid-pricing-params (err u118))
+(define-constant err-bundle-not-found (err u119))
+(define-constant err-bundle-already-exists (err u120))
+(define-constant err-insufficient-tickets-for-bundle (err u121))
 
 ;; data vars
 (define-data-var next-event-id uint u1)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var next-auction-id uint u1)
+(define-data-var next-bundle-id uint u1)
 
 ;; data maps
 (define-map events
@@ -107,6 +111,27 @@
     demand-multiplier: uint,
     time-multiplier: uint,
     last-updated: uint
+  }
+)
+
+(define-map ticket-bundles
+  { bundle-id: uint }
+  {
+    event-id: uint,
+    name: (string-utf8 100),
+    ticket-count: uint,
+    bundle-price: uint,
+    max-bundles: uint,
+    sold-bundles: uint,
+    is-active: bool
+  }
+)
+
+(define-map bundle-purchases
+  { bundle-id: uint, buyer: principal }
+  {
+    purchase-block: uint,
+    tickets-claimed: bool
   }
 )
 
@@ -525,6 +550,105 @@
   )
 )
 
+(define-public (create-ticket-bundle 
+  (event-id uint)
+  (name (string-utf8 100))
+  (ticket-count uint)
+  (bundle-price uint)
+  (max-bundles uint)
+)
+  (let
+    (
+      (event-info (unwrap! (map-get? events { event-id: event-id }) err-not-found))
+      (bundle-id (var-get next-bundle-id))
+    )
+    (asserts! (is-eq tx-sender (get organizer event-info)) err-unauthorized)
+    (asserts! (> ticket-count u1) err-invalid-amount)
+    (asserts! (> bundle-price u0) err-invalid-amount)
+    (asserts! (> max-bundles u0) err-invalid-amount)
+    (asserts! (not (get is-cancelled event-info)) err-event-cancelled)
+    
+    (map-set ticket-bundles
+      { bundle-id: bundle-id }
+      {
+        event-id: event-id,
+        name: name,
+        ticket-count: ticket-count,
+        bundle-price: bundle-price,
+        max-bundles: max-bundles,
+        sold-bundles: u0,
+        is-active: true
+      }
+    )
+    
+    (var-set next-bundle-id (+ bundle-id u1))
+    (ok bundle-id)
+  )
+)
+
+(define-public (purchase-bundle (bundle-id uint))
+  (let
+    (
+      (bundle-info (unwrap! (map-get? ticket-bundles { bundle-id: bundle-id }) err-bundle-not-found))
+      (event-info (unwrap! (map-get? events { event-id: (get event-id bundle-info) }) err-not-found))
+      (current-block burn-block-height)
+      (funds-info (unwrap! (map-get? event-funds { event-id: (get event-id bundle-info) }) err-not-found))
+      (required-tickets (* (get ticket-count bundle-info) (+ (get sold-bundles bundle-info) u1)))
+    )
+    (asserts! (get is-active bundle-info) err-unauthorized)
+    (asserts! (not (get is-cancelled event-info)) err-event-cancelled)
+    (asserts! (< (get sold-bundles bundle-info) (get max-bundles bundle-info)) err-invalid-amount)
+    (asserts! (< current-block (get event-date event-info)) err-event-past)
+    (asserts! (<= (+ (get sold-tickets event-info) (get ticket-count bundle-info)) (get max-tickets event-info)) err-insufficient-tickets-for-bundle)
+    (asserts! (is-none (map-get? bundle-purchases { bundle-id: bundle-id, buyer: tx-sender })) err-already-purchased)
+    
+    (try! (stx-transfer? (get bundle-price bundle-info) tx-sender (as-contract tx-sender)))
+    
+    (map-set bundle-purchases
+      { bundle-id: bundle-id, buyer: tx-sender }
+      {
+        purchase-block: current-block,
+        tickets-claimed: false
+      }
+    )
+    
+    (map-set ticket-bundles
+      { bundle-id: bundle-id }
+      (merge bundle-info { sold-bundles: (+ (get sold-bundles bundle-info) u1) })
+    )
+    
+    (map-set events
+      { event-id: (get event-id bundle-info) }
+      (merge event-info { sold-tickets: (+ (get sold-tickets event-info) (get ticket-count bundle-info)) })
+    )
+    
+    (map-set event-funds
+      { event-id: (get event-id bundle-info) }
+      { total-escrowed: (+ (get total-escrowed funds-info) (get bundle-price bundle-info)) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-bundle (bundle-id uint))
+  (let
+    (
+      (bundle-info (unwrap! (map-get? ticket-bundles { bundle-id: bundle-id }) err-bundle-not-found))
+      (event-info (unwrap! (map-get? events { event-id: (get event-id bundle-info) }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get organizer event-info)) err-unauthorized)
+    (asserts! (get is-active bundle-info) err-unauthorized)
+    
+    (map-set ticket-bundles
+      { bundle-id: bundle-id }
+      (merge bundle-info { is-active: false })
+    )
+    
+    (ok true)
+  )
+)
+
 ;; read only functions
 
 (define-read-only (get-event (event-id uint))
@@ -612,6 +736,18 @@
     )
     final-price
   )
+)
+
+(define-read-only (get-bundle (bundle-id uint))
+  (map-get? ticket-bundles { bundle-id: bundle-id })
+)
+
+(define-read-only (get-bundle-purchase (bundle-id uint) (buyer principal))
+  (map-get? bundle-purchases { bundle-id: bundle-id, buyer: buyer })
+)
+
+(define-read-only (get-next-bundle-id)
+  (var-get next-bundle-id)
 )
 
 ;; private functions
