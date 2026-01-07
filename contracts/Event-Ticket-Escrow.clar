@@ -27,6 +27,10 @@
 (define-constant err-bundle-not-found (err u119))
 (define-constant err-bundle-already-exists (err u120))
 (define-constant err-insufficient-tickets-for-bundle (err u121))
+(define-constant err-already-on-waitlist (err u122))
+(define-constant err-not-on-waitlist (err u123))
+(define-constant err-waitlist-empty (err u124))
+(define-constant err-no-tickets-available (err u125))
 
 ;; data vars
 (define-data-var next-event-id uint u1)
@@ -132,6 +136,24 @@
   {
     purchase-block: uint,
     tickets-claimed: bool
+  }
+)
+
+(define-map waitlist-entries
+  { event-id: uint, buyer: principal }
+  {
+    join-block: uint,
+    priority: uint,
+    deposit-amount: uint,
+    is-active: bool
+  }
+)
+
+(define-map waitlist-counters
+  { event-id: uint }
+  {
+    total-entries: uint,
+    next-priority: uint
   }
 )
 
@@ -649,6 +671,122 @@
   )
 )
 
+(define-public (join-waitlist (event-id uint))
+  (let
+    (
+      (event-info (unwrap! (map-get? events { event-id: event-id }) err-not-found))
+      (current-block burn-block-height)
+      (counter-info (default-to { total-entries: u0, next-priority: u1 } (map-get? waitlist-counters { event-id: event-id })))
+      (deposit (get ticket-price event-info))
+    )
+    (asserts! (not (get is-cancelled event-info)) err-event-cancelled)
+    (asserts! (< current-block (get event-date event-info)) err-event-past)
+    (asserts! (>= (get sold-tickets event-info) (get max-tickets event-info)) err-invalid-amount)
+    (asserts! (is-none (map-get? waitlist-entries { event-id: event-id, buyer: tx-sender })) err-already-on-waitlist)
+    (asserts! (is-none (map-get? tickets { event-id: event-id, buyer: tx-sender })) err-already-purchased)
+    
+    (try! (stx-transfer? deposit tx-sender (as-contract tx-sender)))
+    
+    (map-set waitlist-entries
+      { event-id: event-id, buyer: tx-sender }
+      {
+        join-block: current-block,
+        priority: (get next-priority counter-info),
+        deposit-amount: deposit,
+        is-active: true
+      }
+    )
+    
+    (map-set waitlist-counters
+      { event-id: event-id }
+      {
+        total-entries: (+ (get total-entries counter-info) u1),
+        next-priority: (+ (get next-priority counter-info) u1)
+      }
+    )
+    
+    (ok (get next-priority counter-info))
+  )
+)
+
+(define-public (leave-waitlist (event-id uint))
+  (let
+    (
+      (entry-info (unwrap! (map-get? waitlist-entries { event-id: event-id, buyer: tx-sender }) err-not-on-waitlist))
+      (counter-info (unwrap! (map-get? waitlist-counters { event-id: event-id }) err-not-found))
+    )
+    (asserts! (get is-active entry-info) err-not-on-waitlist)
+    
+    (try! (as-contract (stx-transfer? (get deposit-amount entry-info) tx-sender tx-sender)))
+    
+    (map-set waitlist-entries
+      { event-id: event-id, buyer: tx-sender }
+      (merge entry-info { is-active: false })
+    )
+    
+    (map-set waitlist-counters
+      { event-id: event-id }
+      {
+        total-entries: (- (get total-entries counter-info) u1),
+        next-priority: (get next-priority counter-info)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-from-waitlist (event-id uint))
+  (let
+    (
+      (event-info (unwrap! (map-get? events { event-id: event-id }) err-not-found))
+      (entry-info (unwrap! (map-get? waitlist-entries { event-id: event-id, buyer: tx-sender }) err-not-on-waitlist))
+      (current-block burn-block-height)
+      (funds-info (unwrap! (map-get? event-funds { event-id: event-id }) err-not-found))
+      (counter-info (unwrap! (map-get? waitlist-counters { event-id: event-id }) err-not-found))
+    )
+    (asserts! (get is-active entry-info) err-not-on-waitlist)
+    (asserts! (not (get is-cancelled event-info)) err-event-cancelled)
+    (asserts! (< current-block (get event-date event-info)) err-event-past)
+    (asserts! (< (get sold-tickets event-info) (get max-tickets event-info)) err-no-tickets-available)
+    
+    (map-set tickets
+      { event-id: event-id, buyer: tx-sender }
+      {
+        purchase-block: current-block,
+        is-refunded: false,
+        is-transferred: false,
+        current-owner: tx-sender
+      }
+    )
+    
+    (map-set events
+      { event-id: event-id }
+      (merge event-info { sold-tickets: (+ (get sold-tickets event-info) u1) })
+    )
+    
+    (map-set event-funds
+      { event-id: event-id }
+      { total-escrowed: (+ (get total-escrowed funds-info) (get deposit-amount entry-info)) }
+    )
+    
+    (map-set waitlist-entries
+      { event-id: event-id, buyer: tx-sender }
+      (merge entry-info { is-active: false })
+    )
+    
+    (map-set waitlist-counters
+      { event-id: event-id }
+      {
+        total-entries: (- (get total-entries counter-info) u1),
+        next-priority: (get next-priority counter-info)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
 ;; read only functions
 
 (define-read-only (get-event (event-id uint))
@@ -748,6 +886,18 @@
 
 (define-read-only (get-next-bundle-id)
   (var-get next-bundle-id)
+)
+
+(define-read-only (get-waitlist-entry (event-id uint) (buyer principal))
+  (map-get? waitlist-entries { event-id: event-id, buyer: buyer })
+)
+
+(define-read-only (get-waitlist-counter (event-id uint))
+  (map-get? waitlist-counters { event-id: event-id })
+)
+
+(define-read-only (get-waitlist-size (event-id uint))
+  (default-to u0 (get total-entries (map-get? waitlist-counters { event-id: event-id })))
 )
 
 ;; private functions
